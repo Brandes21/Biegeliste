@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Biegeliste bereinigen</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --border: #dfe3e8;
+    --text: #1c2128;
+    --muted: #5f6b7a;
+    --accent: #2563eb;
+    --accent-soft: #e8efff;
+    --ok: #15803d;
+    --warn: #b45309;
+    --warn-soft: #fff4e5;
+    --err: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121417;
+      --surface: #1b1f24;
+      --border: #2e343c;
+      --text: #e6e9ed;
+      --muted: #9aa5b1;
+      --accent: #6b9bff;
+      --accent-soft: #1d2a45;
+      --ok: #4ade80;
+      --warn: #fbbf24;
+      --warn-soft: #2e2512;
+      --err: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 40px 16px 64px; }
+  h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .lead { color: var(--muted); margin: 0 0 24px; }
+  .status {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 13px; color: var(--muted); margin-bottom: 16px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
+  .status.ready .dot { background: var(--ok); }
+  .status.failed .dot { background: var(--err); }
+  .status.loading .dot { animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity: 0.3; } }
+
+  .drop {
+    display: block;
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    padding: 40px 16px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  .drop strong { display: block; font-size: 17px; margin-bottom: 4px; }
+  .drop span { color: var(--muted); font-size: 14px; }
+  .drop input { display: none; }
+
+  .option { display: flex; gap: 8px; align-items: center; margin: 14px 0 28px; color: var(--muted); font-size: 14px; }
+
+  .files { display: grid; gap: 10px; }
+  .file {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 14px;
+  }
+  .row { display: flex; align-items: center; gap: 12px; }
+  .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+  .state { font-size: 13px; color: var(--muted); white-space: nowrap; }
+  .file.done .state { color: var(--ok); }
+  .file.check .state { color: var(--warn); }
+  .file.error .state { color: var(--err); }
+  .btn {
+    border: 0; border-radius: 8px; padding: 7px 12px;
+    background: var(--accent); color: #fff; font: inherit; font-size: 14px;
+    text-decoration: none; white-space: nowrap;
+  }
+  .warnings {
+    margin: 10px 0 0; padding: 8px 10px; border-radius: 8px;
+    background: var(--warn-soft); color: var(--warn); font-size: 13px;
+  }
+  .warnings ul { margin: 4px 0 0; padding-left: 18px; }
+  details { margin-top: 8px; font-size: 13px; color: var(--muted); }
+  details pre {
+    white-space: pre-wrap; margin: 6px 0 0; font: 12px/1.45 ui-monospace, Consolas, monospace;
+    max-height: 240px; overflow: auto;
+  }
+  footer { margin-top: 40px; font-size: 13px; color: var(--muted); }
+  footer p { margin: 6px 0; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Biegeliste bereinigen</h1>
+  <p class="lead">
+    SOFiSTiK Stahl- und Mattenliste hochladen – überlappende Maße und Winkel in den
+    Biegeformen werden automatisch neu gesetzt. Die Dateien werden nur in deinem
+    Browser verarbeitet und nirgendwohin hochgeladen.
+  </p>
+
+  <div class="status loading" id="status"><span class="dot"></span><span id="status-text">Lade Python … (beim ersten Mal ca. 20 MB, danach aus dem Cache)</span></div>
+
+  <label class="drop" id="drop">
+    <input type="file" id="picker" accept=".pdf,application/pdf" multiple>
+    <strong>PDFs hierher ziehen</strong>
+    <span>oder klicken zum Auswählen – mehrere Dateien möglich</span>
+  </label>
+
+  <label class="option">
+    <input type="checkbox" id="only">
+    Nur Biegeformen neu zeichnen, deren Beschriftung sich im Original überlappt
+  </label>
+
+  <div class="files" id="files"></div>
+
+  <footer>
+    <p>Bitte das Ergebnis stichprobenartig mit dem Original vergleichen. Hinweise unter
+      „Bitte prüfen“ zeigen Stellen, an denen kein sauberer Platz gefunden wurde.</p>
+    <p>Abgestimmt auf SOFiSTiK 2024 (STLI). Verwendet <a href="https://pyodide.org">Pyodide</a>
+      und <a href="https://pymupdf.readthedocs.io">PyMuPDF</a> (AGPL-3.0).</p>
+  </footer>
+</main>
+
+<script>
+  const worker = new Worker("worker.js");
+  const statusEl = document.getElementById("status");
+  const statusText = document.getElementById("status-text");
+  const filesEl = document.getElementById("files");
+  const onlyEl = document.getElementById("only");
+  const jobs = new Map();
+  let nextId = 0;
+
+  worker.onmessage = (e) => {
+    const msg = e.data;
+    if (msg.type === "ready") {
+      statusEl.className = "status ready";
+      statusText.textContent = "Bereit";
+    } else if (msg.type === "failed") {
+      statusEl.className = "status failed";
+      statusText.textContent = "Python konnte nicht geladen werden: " + msg.error;
+    } else if (msg.type === "started") {
+      jobs.get(msg.id).el.querySelector(".state").textContent = "wird bearbeitet …";
+    } else if (msg.type === "done") {
+      finish(jobs.get(msg.id), msg);
+    }
+  };
+
+  function addFile(file) {
+    const id = nextId++;
+    const el = document.createElement("div");
+    el.className = "file";
+    el.innerHTML = `<div class="row"><span class="name"></span><span class="state">wartet …</span></div>`;
+    el.querySelector(".name").textContent = file.name;
+    filesEl.prepend(el);
+    jobs.set(id, { el, name: file.name });
+    file.arrayBuffer().then((data) => {
+      worker.postMessage({ id, data, onlyOverlaps: onlyEl.checked }, [data]);
+    });
+  }
+
+  function finish(job, msg) {
+    const { el, name } = job;
+    const state = el.querySelector(".state");
+    const row = el.querySelector(".row");
+    const lines = msg.log.join("\n").split("\n");
+    const count = lines.find((l) => l.includes("Biegeformen neu gezeichnet"));
+    const checks = lines.filter((l) => /^\s+(Seite|Warnung)/.test(l) && !l.includes("neu gezeichnet"));
+
+    if (msg.ok) {
+      const blob = new Blob([msg.out], { type: "application/pdf" });
+      const a = document.createElement("a");
+      a.className = "btn";
+      a.href = URL.createObjectURL(blob);
+      a.download = name.replace(/\.pdf$/i, "") + "_bereinigt.pdf";
+      a.textContent = "Herunterladen";
+      row.append(a);
+      const n = count ? count.trim().split(" ")[0] : "0";
+      state.textContent = `${n} Biegeformen neu gezeichnet`;
+      el.classList.add(checks.length ? "check" : "done");
+    } else {
+      const log = msg.log.join("\n");
+      state.textContent = log.includes("FileDataError") ? "Keine gültige PDF-Datei"
+        : log.includes("geöffnet") ? "Konnte nicht gespeichert werden"
+        : "Fehler – siehe Protokoll";
+      el.classList.add("error");
+    }
+
+    if (checks.length) {
+      const box = document.createElement("div");
+      box.className = "warnings";
+      box.innerHTML = "<strong>Bitte prüfen:</strong><ul></ul>";
+      for (const c of checks) {
+        const li = document.createElement("li");
+        li.textContent = c.trim().replace(/^Warnung /, "");
+        box.querySelector("ul").append(li);
+      }
+      el.append(box);
+    }
+
+    const details = document.createElement("details");
+    details.innerHTML = "<summary>Protokoll</summary><pre></pre>";
+    details.querySelector("pre").textContent = msg.log.join("\n");
+    el.append(details);
+  }
+
+  function handle(fileList) {
+    for (const f of fileList) {
+      if (f.name.toLowerCase().endsWith(".pdf")) addFile(f);
+    }
+  }
+
+  const drop = document.getElementById("drop");
+  document.getElementById("picker").addEventListener("change", (e) => {
+    handle(e.target.files);
+    e.target.value = "";
+  });
+  ["dragenter", "dragover"].forEach((t) =>
+    drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "drop"].forEach((t) =>
+    drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+  drop.addEventListener("drop", (e) => handle(e.dataTransfer.files));
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+# Projektunterlagen niemals ins Repository
+input/
+output/
+*.pdf
+__pycache__/
