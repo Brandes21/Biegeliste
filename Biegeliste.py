@@ -22,11 +22,11 @@ import pymupdf
 FONT_FILE = Path(r"C:\Windows\Fonts\consola.ttf")
 FONT_SIZE = 8.5
 LINE_WIDTH = 1.0
-PAD = 1.2            # Mindestabstand zwischen Beschriftungen/Linien
+PAD = 1           # Mindestabstand zwischen Beschriftungen/Linien
 MARGIN_X = 22        # Platz links/rechts der Form für Beschriftung
 MARGIN_Y = 11        # Platz oben/unten der Form für Beschriftung
 MAX_SHAPE_WIDTH = 175
-OVERLAP_GAP = 3.5    # Abstand übereinanderliegender Schenkel (Übergreifung)
+OVERLAP_GAP = 3    # Abstand übereinanderliegender Schenkel (Übergreifung)
 
 NUM = re.compile(r"^-?\d+(\.\d+)?$")
 LABEL = re.compile(r"^(-?\d+(\.\d+)?°?|-\d+-)$")    # Maß, Winkel oder variabler Schenkel
@@ -112,10 +112,11 @@ def rotate(v, deg):
 # ---------------------------------------------------------------- Beschriftung
 
 class Labeler:
-    def __init__(self, font, region, segments):
+    def __init__(self, font, region, groups):
         self.font = font
         self.region = region
-        self.segments = segments      # [(p, q)] der neuen Form
+        self.groups = groups          # je Schenkel [(p, q), ...] (Bogen: viele Stücke)
+        self.segments = [s for g in groups for s in g]   # alle Teilstrecken
         self.placed = []              # belegte Text-Rechtecke
         self.problems = []            # Beschriftungen ohne sauberen Platz
 
@@ -184,12 +185,17 @@ def dist_point_seg(c, p, q):
     return abs(c - nearest_on_seg(c, p, q))
 
 
-def closer_to_own_segment(k, segs):
+def dist_group(c, group):
+    """Abstand zu einem Schenkel = Liste von Teilstrecken (Bogen: viele)."""
+    return min(dist_point_seg(c, p, q) for p, q in group)
+
+
+def closer_to_own_segment(k, groups):
     """Textmitte liegt näher an Schenkel k als an allen anderen Schenkeln."""
     def ok(r):
         c = (r.tl + r.br) / 2
-        own = dist_point_seg(c, *segs[k])
-        return all(own <= dist_point_seg(c, *s) + 0.5 for j, s in enumerate(segs) if j != k)
+        own = dist_group(c, groups[k])
+        return all(own <= dist_group(c, g) + 0.5 for j, g in enumerate(groups) if j != k)
     return ok
 
 
@@ -198,8 +204,8 @@ def clear_of_other_segments(own, segs, clearance=8.0):
     (verhindert Beschriftung in engen Spalten zwischen Schenkeln)."""
     def ok(r):
         probe = [r.tl, r.tr, r.bl, r.br, (r.tl + r.br) / 2]
-        return all(min(dist_point_seg(c, *s) for c in probe) >= clearance
-                   for j, s in enumerate(segs) if j not in own)
+        return all(min(dist_group(c, g) for c in probe) >= clearance
+                   for j, g in enumerate(segs) if j not in own)
     return ok
 
 
@@ -232,14 +238,22 @@ def find_shapes(page):
                     spans.append((pymupdf.Rect(s["bbox"]), s["text"]))
 
     drawings = page.get_drawings()
-    hlines = []
+    # Alle Einzelstrecken (auch aus mehrteiligen Pfaden und Rechtecken):
+    # manche Listen zeichnen das Tabellengitter zeilenweise als Pfade.
+    segs = []
+    for d in drawings:
+        for i in d["items"]:
+            if i[0] == "l":
+                segs.append((i[1], i[2]))
+            elif i[0] == "re":
+                q = i[1]
+                segs += [(q.tl, q.tr), (q.bl, q.br), (q.tl, q.bl), (q.tr, q.br)]
+    hlines = [(a, b) for a, b in segs if abs(a.y - b.y) < 0.1 and abs(a.x - b.x) > 0.5]
     polylines = []
     for d in drawings:
         items = d["items"]
         if not items or any(i[0] != "l" for i in items):
             continue
-        if len(items) == 1 and abs(items[0][1].y - items[0][2].y) < 0.1:
-            hlines.append((items[0][1], items[0][2]))
         if (d.get("width") or 0) > 0.8:
             pts = [items[0][1]] + [i[2] for i in items]
             polylines.append((pymupdf.Rect(d["rect"]), pts))
@@ -251,10 +265,13 @@ def find_shapes(page):
             col = r
     if col is None:
         return []
-    vx = sorted({round(d["items"][0][1].x, 1) for d in drawings
-                 if len(d["items"]) == 1 and d["items"][0][0] == "l"
-                 and abs(d["items"][0][1].x - d["items"][0][2].x) < 0.1
-                 and abs(d["items"][0][1].y - d["items"][0][2].y) > 100})
+    # Spaltentrenner = senkrechte Strecken, die die Kopfzeile "Biegeform" kreuzen
+    ymid = (col.y0 + col.y1) / 2
+    vx = sorted({round(a.x, 1) for a, b in segs
+                 if abs(a.x - b.x) < 0.1 and min(a.y, b.y) < ymid < max(a.y, b.y)})
+    if not any(x < col.x0 for x in vx) or not any(x > col.x0 + 100 for x in vx):
+        print(f"  Warnung Seite {page.number + 1}: Spalte 'Biegeform' nicht erkannt - übersprungen")
+        return []
     pos_col_x1 = next((r.x1 + 3 for r, t in spans if t.strip().startswith("Pos.")), 0)
     left = max(x for x in vx if x < col.x0)
     right = min(x for x in vx if x > col.x1 and x > col.x0 + 100)
@@ -285,7 +302,8 @@ def find_shapes(page):
             continue
         claimed.append(polys[0][0])
         pts = polys[0][1]
-        if len(pts) - 1 != len(table):
+        paths = group_pieces(pts, table)
+        if paths is None:
             print(f"  Warnung Seite {page.number + 1}, Pos. {pos}: {len(pts)-1} Segmente, "
                   f"aber {len(table)} Tabellenzeilen - übersprungen")
             continue
@@ -294,7 +312,7 @@ def find_shapes(page):
         variable = {int(m.group(1)) for _, lt in labels
                     if (m := re.fullmatch(r"-(\d+)-", lt.strip()))}
         shapes.append(dict(region=region, points=pts, table=table, labels=labels,
-                           pos=pos, variable=variable, dims=[]))
+                           pos=pos, variable=variable, dims=[], paths=paths))
 
     # Katalogformen ohne Segmenttabelle (z.B. C1): Maße nur in den Spalten A-H,
     # die Originalbeschriftung wird übernommen und nur verschoben.
@@ -325,28 +343,130 @@ def find_shapes(page):
     return shapes
 
 
+def span_tokens(r, t):
+    """Wörter eines Spans mit geschätzter x-Lage (Listen sind in Festbreitenschrift)."""
+    cw = r.width / max(len(t), 1)
+    for m in re.finditer(r"\S+", t):
+        yield r.x0 + m.start() * cw, r.x0 + m.end() * cw, m.group()
+
+
 def read_table(spans, header):
-    """Zeilen unter 'Nr.': [(l, winkel_oder_None, nr_oder_None)].
-    Hakenzeilen (Bügel) haben keine Nummer, nur 'l' und ggf. Winkel."""
+    """Zeilen unter 'Nr.': [(l, winkel_oder_None, nr_oder_None, radius_oder_None)].
+    Hakenzeilen (Bügel) haben keine Nummer, nur 'l' und ggf. Winkel.
+    Bogenzeilen haben zusätzlich r, Sehne, ab, Wink."""
+    heads = {}
+    for r, t in spans:
+        if abs(r.y0 - header.y0) < 1 and header.x0 - 2 < r.x0 < header.x0 + 300:
+            for x0, x1, w in span_tokens(r, t):
+                heads.setdefault(w, (x0, x1))
+    ang_head = next((v for w, v in heads.items() if w.startswith(">")), None)
+    r_head = heads.get("r")
     rows = {}
     for r, t in spans:
-        if r.y0 > header.y1 - 1 and header.x0 - 2 < r.x0 < header.x0 + 140:
-            rows.setdefault(round(r.y0, 0), []).append((r.x0, t))
+        if r.y0 > (header.y0 + header.y1) / 2 and header.x0 - 2 < r.x0 < header.x0 + 140:
+            rows.setdefault(round(r.y0, 0), []).extend(span_tokens(r, t))
     out = []
     nr = 0
     for y in sorted(rows):
         items = sorted(rows[y])
-        toks = " ".join(t for _, t in items).split()
+        if r_head:                                   # Sehne, ab, Wink ignorieren
+            items = [i for i in items if i[1] <= r_head[1] + 2]
+        toks = [w for _, _, w in items]
         if not toks or not all(NUM.match(x) for x in toks):
             break
         if len(toks) >= 4 and toks[0].isdigit() and int(toks[0]) == nr + 1:
             nr += 1
-            out.append((float(toks[3]), toks[4] if len(toks) > 4 else None, nr))
+            ang = rad = None
+            for x0, x1, w in items[4:]:
+                if ang_head and r_head:              # Spalte nach rechter Kante
+                    if x1 <= ang_head[1] + 2:
+                        ang = w
+                    else:
+                        rad = float(w)
+                elif ang is None:
+                    ang = w
+            out.append((float(toks[3]), ang, nr, rad))
         elif len(toks) <= 2 and items[0][0] > header.x0 + 60:   # Haken
-            out.append((float(toks[0]), toks[1] if len(toks) > 1 else None, None))
+            out.append((float(toks[0]), toks[1] if len(toks) > 1 else None, None, None))
         else:
             break
     return out
+
+
+def group_pieces(pts, table):
+    """Teilstrecken des Linienzugs den Tabellenzeilen zuordnen: gerader
+    Schenkel = 1 Stück, Bogen (Zeile mit Radius) = mehrere kurze Stücke.
+    Liefert je Zeile die Punktliste oder None, wenn es nicht aufgeht."""
+    n = len(pts) - 1
+    arcs = [i for i, row in enumerate(table) if row[3] is not None]
+    if not arcs:
+        return [[pts[i], pts[i + 1]] for i in range(n)] if n == len(table) else None
+    remaining = n - (len(table) - len(arcs))
+    if remaining < len(arcs):
+        return None
+    lens = [abs(pts[j + 1] - pts[j]) for j in range(n)]
+    total_l = sum(row[0] for row in table)
+    if total_l <= 0:
+        return None
+    scale = sum(lens) / total_l
+    out, j = [], 0
+    for i, row in enumerate(table):
+        if row[3] is None:
+            c = 1
+        else:
+            later = sum(1 for a in arcs if a > i)
+            if not later:
+                c = remaining
+            else:                                    # Stücke nach Länge verteilen
+                target, c, acc = row[0] * scale, 0, 0.0
+                while c < remaining - later and (c == 0 or acc + lens[j + c] / 2 < target):
+                    acc += lens[j + c]
+                    c += 1
+            remaining -= c
+        glen = sum(lens[j:j + c])
+        if abs(glen - row[0] * scale) > 0.25 * row[0] * scale + 2:
+            return None                              # Längen passen nicht zur Tabelle
+        out.append(pts[j:j + c + 1])
+        j += c
+    return out if j == n else None
+
+
+def smooth_arc(pts):
+    """Bogen als glatten Kreisbogen durch Anfang, Mitte und Ende neu erzeugen."""
+    A, M, B = pts[0], pts[len(pts) // 2], pts[-1]
+    D = 2 * (A.x * (M.y - B.y) + M.x * (B.y - A.y) + B.x * (A.y - M.y))
+    if abs(D) < 1e-6:
+        return list(pts)
+    a2, m2, b2 = A.x ** 2 + A.y ** 2, M.x ** 2 + M.y ** 2, B.x ** 2 + B.y ** 2
+    C = pymupdf.Point((a2 * (M.y - B.y) + m2 * (B.y - A.y) + b2 * (A.y - M.y)) / D,
+                      (a2 * (B.x - M.x) + m2 * (A.x - B.x) + b2 * (M.x - A.x)) / D)
+    R = abs(A - C)
+    a0 = math.atan2(A.y - C.y, A.x - C.x)
+    am = math.atan2(M.y - C.y, M.x - C.x)
+    a1 = math.atan2(B.y - C.y, B.x - C.x)
+    tau = 2 * math.pi
+    sweep = (a1 - a0) % tau
+    if (am - a0) % tau > sweep:                      # andere Richtung herum
+        sweep -= tau
+    steps = max(8, int(abs(sweep) * R / 2) + 1)
+    out = [C + pymupdf.Point(math.cos(a0 + sweep * i / steps),
+                             math.sin(a0 + sweep * i / steps)) * R for i in range(steps + 1)]
+    out[0], out[-1] = A, B
+    return out
+
+
+def point_along(line, t):
+    """Punkt und Richtung bei Anteil t der Länge eines Linienzugs."""
+    pieces = list(zip(line[:-1], line[1:]))
+    lens = [abs(q - p) for p, q in pieces]
+    goal = sum(lens) * t
+    for (p, q), L in zip(pieces, lens):
+        if goal <= L:
+            f = 0.0 if L < 1e-9 else goal / L
+            return p + (q - p) * f, unit(q - p)
+        goal -= L
+    p, q = pieces[-1]
+    return q, unit(q - p)
 
 
 def has_overlap(labels):
@@ -368,8 +488,8 @@ def fmt_length(l):
 def place_angle(lab, writer, font, new, k, text, leaders):
     """Winkelbeschriftung an den Knick k heften (bevorzugt außen an der Ecke)."""
     v = new[k]
-    a = unit(new[k - 1] - v)
-    b = unit(new[k + 1] - v)
+    a = unit(lab.groups[k - 1][-1][0] - v)       # bei Bögen: Tangentenrichtung
+    b = unit(lab.groups[k][0][1] - v)
     inside = unit(a + b)
     if abs(inside) < 1e-6:                           # gerader Stoß (0°)
         inside = pymupdf.Point(-a.y, a.x)
@@ -381,7 +501,7 @@ def place_angle(lab, writer, font, new, k, text, leaders):
         for rot in (0, 25, -25, 50, -50, 75, -75, 100, -100, 135, -135, 180):
             cands.append(offset_center(v, rotate(outside, rot), dist, w, h))
     r, leader = lab.place(text, cands, v, closer_to_own_vertex(k, new),
-                          clear_of_other_segments({k - 1, k}, lab.segments))
+                          clear_of_other_segments({k - 1, k}, lab.groups))
     writer.append((r.x0, r.y1 - FONT_SIZE * 0.02), text, font=font, fontsize=FONT_SIZE)
     if leader:
         leaders.append(leader)
@@ -399,11 +519,27 @@ def place_original_labels(shape, lab, writer, font, transform, new, leaders):
     def seg_dist(lr):
         c = (lr.tl + lr.br) / 2
         return min(dist_point_seg(c, p, q) for p, q in zip(pts[:-1], pts[1:]))
+    def nearest_seg(lr):
+        c = (lr.tl + lr.br) / 2
+        return min(range(len(pts) - 1), key=lambda j: dist_point_seg(c, pts[j], pts[j + 1]))
     keep = []
     for text in dict.fromkeys(t for _, t in labels):
         same = sorted((lr for lr, t in labels if t == text), key=seg_dist)
         if allowed[text] and not text.endswith("°"):
-            same = same[:allowed[text]]
+            # Überzählige Exemplare behalten, wenn sie an einem anderen, gleich
+            # langen Schenkel stehen (symmetrische Formen wie C3 haben nur ein
+            # Spaltenmaß für beide Schenkel)
+            def seg_len(j):
+                return abs(pts[j + 1] - pts[j])
+            kept = same[:allowed[text]]
+            used = {nearest_seg(lr) for lr in kept}
+            for lr in same[allowed[text]:]:
+                j = nearest_seg(lr)
+                if j not in used and any(abs(seg_len(j) - seg_len(u)) <= 0.05 * max(seg_len(j), seg_len(u))
+                                         for u in used):
+                    kept.append(lr)
+                    used.add(j)
+            same = kept
         keep += [(lr, text) for lr in same]
 
     keep.sort(key=lambda e: not e[1].endswith("°"))   # Winkel zuerst
@@ -453,17 +589,26 @@ def redraw(page, shape, font, writer):
     def transform(p):
         return pymupdf.Point(p.x * s + ox, p.y * s + oy)
 
-    new = separate_overlaps([transform(p) for p in pts], s)
-    segs = list(zip(new[:-1], new[1:]))
+    paths = shape.get("paths")
+    if paths and any(len(g) > 2 for g in paths):
+        # Form mit Bögen: Bögen glatt neu erzeugen, gerade Schenkel bleiben
+        fine = [smooth_arc([transform(p) for p in g]) if len(g) > 2
+                else [transform(g[0]), transform(g[-1])] for g in paths]
+        new = [f[0] for f in fine] + [fine[-1][-1]]
+    else:
+        new = separate_overlaps([transform(p) for p in pts], s)
+        fine = [[p, q] for p, q in zip(new[:-1], new[1:])]
+    groups = [list(zip(f[:-1], f[1:])) for f in fine]   # Teilstrecken je Schenkel
+    outline = [fine[0][0]] + [p for f in fine for p in f[1:]]
 
     shape_draw = page.new_shape()
-    shape_draw.draw_polyline(new)
+    shape_draw.draw_polyline(outline)
     shape_draw.finish(color=(0, 0, 0), width=LINE_WIDTH, closePath=False,
                       lineCap=1, lineJoin=1)
 
-    centroid = pymupdf.Point(sum(p.x for p in new) / len(new),
-                             sum(p.y for p in new) / len(new))
-    lab = Labeler(font, region, segs)
+    centroid = pymupdf.Point(sum(p.x for p in outline) / len(outline),
+                             sum(p.y for p in outline) / len(outline))
+    lab = Labeler(font, region, groups)
     h = FONT_SIZE * 0.72
     leaders = []
 
@@ -473,33 +618,35 @@ def redraw(page, shape, font, writer):
     # 1) Winkel an die Knickpunkte (Winkel in Zeile i gilt am Ende von Segment i).
     #    Zuerst, weil ein Winkel nur um seinen Punkt herum ausweichen kann.
     table = shape["table"] or []
-    for i, (_, ang, nr) in enumerate(table):
+    for i, (_, ang, nr, _r) in enumerate(table):
         if ang is None or i + 1 >= len(new) - 0:
             continue
         # Hakenwinkel (Bügel) beschriftet SOFiSTiK nicht - wir auch nicht
         if nr is None or (i + 1 < len(table) and table[i + 1][2] is None):
             continue
-        if i + 1 >= len(segs):
+        if i + 1 >= len(groups):
             continue
         place_angle(lab, writer, font, new, i + 1, f"{ang}°", leaders)
 
     # 2) Längen an die Schenkel
-    for k, ((p, q), (l, _, nr)) in enumerate(zip(segs, table)):
+    for k, (line, (l, _, nr, _r)) in enumerate(zip(fine, table)):
         text = f"-{nr}-" if nr in shape["variable"] else fmt_length(l)
         w = font.text_length(text, FONT_SIZE)
-        d = unit(q - p)
+        mid, d = point_along(line, 0.5)
         n = pymupdf.Point(-d.y, d.x)
-        mid = (p + q) / 2
         if (mid - centroid).x * n.x + (mid - centroid).y * n.y < 0:
             n = -n                                   # nach außen zeigen
         cands = []
         for dist in (1.5, 4, 8, 13):
             for t in (0.5, 0.35, 0.65, 0.2, 0.8):
-                base = p + (q - p) * t
-                for side in (n, -n):
+                base, dt = point_along(line, t)      # bei Bögen: Punkt auf dem Bogen
+                nt = pymupdf.Point(-dt.y, dt.x)
+                if nt.x * n.x + nt.y * n.y < 0:
+                    nt = -nt                         # gleiche Seite wie in der Mitte
+                for side in (nt, -nt):
                     cands.append(offset_center(base, side, dist, w, h))
-        r, leader = lab.place(text, cands, mid, closer_to_own_segment(k, segs),
-                              clear_of_other_segments({k - 1, k, k + 1}, segs))
+        r, leader = lab.place(text, cands, mid, closer_to_own_segment(k, groups),
+                              clear_of_other_segments({k - 1, k, k + 1}, groups))
         writer.append((r.x0, r.y1 - FONT_SIZE * 0.02), text, font=font, fontsize=FONT_SIZE)
         if leader:
             leaders.append(leader)
@@ -512,8 +659,8 @@ def redraw(page, shape, font, writer):
 
     # Abschlusskontrolle: alles innerhalb der Zelle?
     problems = list(lab.problems)
-    nb = pymupdf.Rect(new[0], new[0])
-    for p in new[1:]:
+    nb = pymupdf.Rect(outline[0], outline[0])
+    for p in outline[1:]:
         nb |= p
     if not region.contains(nb):
         problems.append("Skizze ragt aus der Zelle")
